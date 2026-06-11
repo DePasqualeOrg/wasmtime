@@ -115,6 +115,22 @@ WASI_API_EXTERN bool wasi_config_set_env(wasi_config_t *config, size_t envc,
 WASI_API_EXTERN void wasi_config_inherit_env(wasi_config_t *config);
 
 /**
+ * \brief Sets the initial working directory reported to the guest through
+ * `wasi:cli/environment#initial-cwd`.
+ *
+ * By default no initial working directory is set. This is informational for
+ * the guest; it does not affect how preopened directories resolve paths.
+ *
+ * The `cwd` string is copied into the `config` object as part of this
+ * function call.
+ *
+ * This function returns `true` on success, or `false` if `cwd` is not valid
+ * UTF-8.
+ */
+WASI_API_EXTERN bool wasi_config_set_initial_cwd(wasi_config_t *config,
+                                                 const char *cwd);
+
+/**
  * \brief Configures standard input to be taken from the specified file.
  *
  * By default WASI programs have no stdin, but this configures the specified
