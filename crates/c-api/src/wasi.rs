@@ -114,6 +114,19 @@ pub extern "C" fn wasi_config_inherit_env(config: &mut wasi_config_t) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasi_config_set_initial_cwd(
+    config: &mut wasi_config_t,
+    cwd: *const c_char,
+) -> bool {
+    let cwd = match cstr_to_str(cwd) {
+        Some(s) => s,
+        None => return false,
+    };
+    config.builder.initial_cwd(cwd);
+    true
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasi_config_set_stdin_file(
     config: &mut wasi_config_t,
     path: *const c_char,
