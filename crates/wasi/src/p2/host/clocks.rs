@@ -1,4 +1,4 @@
-use crate::clocks::WasiClocksCtxView;
+use crate::clocks::{WasiClocksCtxView, WasiClocksInterrupt};
 use crate::p2::DynPollable;
 use crate::p2::bindings::{
     clocks::monotonic_clock::{self, Duration as WasiDuration, Instant},
@@ -71,19 +71,21 @@ impl wall_clock::Host for WasiClocksCtxView<'_> {
 fn subscribe_to_duration(
     table: &mut wasmtime::component::ResourceTable,
     duration: tokio::time::Duration,
+    interrupt: Option<WasiClocksInterrupt>,
 ) -> wasmtime::Result<Resource<DynPollable>> {
-    let sleep = if duration.is_zero() {
-        table.push(Deadline::Past { yielded: false })?
+    let kind = if duration.is_zero() {
+        DeadlineKind::Past { yielded: false }
     } else if let Some(deadline) = tokio::time::Instant::now().checked_add(duration) {
-        // NB: this resource created here is not actually exposed to wasm, it's
-        // only an internal implementation detail used to match the signature
-        // expected by `subscribe`.
-        table.push(Deadline::Instant(deadline))?
+        DeadlineKind::Instant(deadline)
     } else {
         // If the user specifies a time so far in the future we can't
         // represent it, wait forever rather than trap.
-        table.push(Deadline::Never)?
+        DeadlineKind::Never
     };
+    // NB: this resource created here is not actually exposed to wasm, it's
+    // only an internal implementation detail used to match the signature
+    // expected by `subscribe`.
+    let sleep = table.push(Deadline { kind, interrupt })?;
     subscribe(table, sleep)
 }
 
@@ -103,18 +105,27 @@ impl monotonic_clock::Host for WasiClocksCtxView<'_> {
         } else {
             Duration::from_nanos(0)
         };
-        subscribe_to_duration(self.table, duration)
+        subscribe_to_duration(self.table, duration, self.ctx.interrupt.clone())
     }
 
     fn subscribe_duration(
         &mut self,
         duration: WasiDuration,
     ) -> wasmtime::Result<Resource<DynPollable>> {
-        subscribe_to_duration(self.table, Duration::from_nanos(duration))
+        subscribe_to_duration(
+            self.table,
+            Duration::from_nanos(duration),
+            self.ctx.interrupt.clone(),
+        )
     }
 }
 
-enum Deadline {
+struct Deadline {
+    kind: DeadlineKind,
+    interrupt: Option<WasiClocksInterrupt>,
+}
+
+enum DeadlineKind {
     Past { yielded: bool },
     Instant(tokio::time::Instant),
     Never,
@@ -123,9 +134,21 @@ enum Deadline {
 #[async_trait::async_trait]
 impl Pollable for Deadline {
     async fn ready(&mut self) {
+        let Some(interrupt) = &self.interrupt else {
+            return self.kind.ready().await;
+        };
+        // A triggered interrupt makes every deadline ready at once.
+        let ready = std::pin::pin!(self.kind.ready());
+        let triggered = std::pin::pin!(interrupt.triggered());
+        futures::future::select(ready, triggered).await;
+    }
+}
+
+impl DeadlineKind {
+    async fn ready(&mut self) {
         match self {
-            Deadline::Past { yielded: true } => {}
-            Deadline::Past { yielded } => {
+            DeadlineKind::Past { yielded: true } => {}
+            DeadlineKind::Past { yielded } => {
                 // It is important we yield to Tokio here; otherwise we risk
                 // starving `mio` such that it is unable to signal readiness for
                 // other pollables (e.g. TCP sockets) when the guest is polling
@@ -146,8 +169,8 @@ impl Pollable for Deadline {
                 *yielded = true;
                 tokio::task::yield_now().await
             }
-            Deadline::Instant(instant) => tokio::time::sleep_until(*instant).await,
-            Deadline::Never => std::future::pending().await,
+            DeadlineKind::Instant(instant) => tokio::time::sleep_until(*instant).await,
+            DeadlineKind::Never => std::future::pending().await,
         }
     }
 }
