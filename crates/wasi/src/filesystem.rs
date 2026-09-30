@@ -982,6 +982,15 @@ impl Dir {
             opts.follow(FollowSymlinks::No);
         }
 
+        // Opening a FIFO blocks until the other end is opened, which no
+        // interruption of the guest can end. Open without blocking, then
+        // restore blocking I/O below; a FIFO no one reads from cannot be
+        // opened for writing.
+        #[cfg(unix)]
+        {
+            opts.nonblock = true;
+        }
+
         // These flags are not yet supported in cap-primitives:
         if flags.contains(DescriptorFlags::FILE_INTEGRITY_SYNC)
             || flags.contains(DescriptorFlags::DATA_INTEGRITY_SYNC)
@@ -1019,6 +1028,11 @@ impl Dir {
         let opened = self
             .run_blocking::<_, std::io::Result<OpenResult>>(move |d| {
                 let opened = crate::filesystem::primitives::open(d, path.as_ref(), &opts)?;
+                #[cfg(unix)]
+                {
+                    let flags = rustix::fs::fcntl_getfl(&opened)?;
+                    rustix::fs::fcntl_setfl(&opened, flags - rustix::fs::OFlags::NONBLOCK)?;
+                }
                 if Metadata::from_file(&opened)?.is_dir() {
                     Ok(OpenResult::Dir(opened))
                 } else if oflags.contains(OpenFlags::DIRECTORY) {
