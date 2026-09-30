@@ -131,6 +131,52 @@ WASI_API_EXTERN bool wasi_config_set_initial_cwd(wasi_config_t *config,
                                                  const char *cwd);
 
 /**
+ * \typedef wasi_clocks_interrupt_t
+ * \brief Convenience alias for #wasi_clocks_interrupt_t
+ *
+ * \struct wasi_clocks_interrupt_t
+ * \brief A signal that ends a guest's waits on WASI clock deadlines early.
+ *
+ * Epoch interruption stops a guest only while it runs WebAssembly code; a
+ * guest sleeping in `poll_oneoff` or `wasi:io/poll` blocks its thread until
+ * the deadline passes. Triggering this interrupt makes every current and
+ * later wait on a clock deadline, in each store whose configuration received
+ * it, report ready at once, so the guest returns to WebAssembly code where
+ * the embedder's own interruption takes effect. Once triggered it stays
+ * triggered.
+ *
+ * \fn void wasi_clocks_interrupt_delete(wasi_clocks_interrupt_t *);
+ * \brief Deletes an interrupt handle. Configurations and stores that
+ * received the interrupt keep their own reference to it.
+ */
+WASI_DECLARE_OWN(clocks_interrupt)
+
+/**
+ * \brief Creates an interrupt that has not been triggered.
+ *
+ * The caller is expected to deallocate the returned interrupt.
+ */
+WASI_API_EXTERN own wasi_clocks_interrupt_t *wasi_clocks_interrupt_new(void);
+
+/**
+ * \brief Triggers `interrupt`. Safe to call from any thread, including while
+ * a store that received it is running.
+ */
+WASI_API_EXTERN void
+wasi_clocks_interrupt_trigger(const wasi_clocks_interrupt_t *interrupt);
+
+/**
+ * \brief Makes the guest's waits on clock deadlines end once `interrupt` is
+ * triggered.
+ *
+ * The configuration keeps its own reference to `interrupt`, which the caller
+ * still owns.
+ */
+WASI_API_EXTERN void
+wasi_config_set_clocks_interrupt(wasi_config_t *config,
+                                 const wasi_clocks_interrupt_t *interrupt);
+
+/**
  * \brief Configures standard input to be taken from the specified file.
  *
  * By default WASI programs have no stdin, but this configures the specified

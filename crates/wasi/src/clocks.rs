@@ -2,6 +2,8 @@ use crate::{NamedId, WasiCtxNamedView};
 use std::error::Error;
 use std::fmt;
 use std::marker;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use wasmtime::component::{HasData, ResourceTable};
 
@@ -52,6 +54,7 @@ impl HasData for WasiClocks {
 pub struct WasiClocksCtx {
     pub(crate) wall_clock: Box<dyn HostWallClock + Send>,
     pub(crate) monotonic_clock: Box<dyn HostMonotonicClock + Send>,
+    pub(crate) interrupt: Option<WasiClocksInterrupt>,
 }
 
 impl Default for WasiClocksCtx {
@@ -59,6 +62,58 @@ impl Default for WasiClocksCtx {
         Self {
             wall_clock: wall_clock(),
             monotonic_clock: monotonic_clock(),
+            interrupt: None,
+        }
+    }
+}
+
+/// A signal that ends a guest's waits on `wasi:clocks` deadlines early.
+///
+/// Epoch interruption and fuel stop a guest only while it runs Wasm code; a
+/// guest sleeping in `wasi:io/poll` or `poll_oneoff` on a synchronous WASI
+/// context blocks its thread until the deadline passes. An embedder that
+/// stops a guest can trigger this interrupt as well: every wait on a clock
+/// deadline, current or later, then reports ready at once, so the guest
+/// returns to Wasm code, where the embedder's own interruption takes effect.
+/// Once triggered it stays triggered.
+#[derive(Clone, Default)]
+pub struct WasiClocksInterrupt(Arc<InterruptState>);
+
+#[derive(Default)]
+struct InterruptState {
+    triggered: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl WasiClocksInterrupt {
+    /// Creates an interrupt that has not been triggered.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ends every current and later wait on a clock deadline.
+    pub fn trigger(&self) {
+        self.0.triggered.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+
+    /// Whether [`trigger`](Self::trigger) has been called.
+    pub fn is_triggered(&self) -> bool {
+        self.0.triggered.load(Ordering::SeqCst)
+    }
+
+    /// Completes once the interrupt is triggered.
+    pub(crate) async fn triggered(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            let mut notified = std::pin::pin!(notified);
+            // Register before checking the flag, so a trigger between the two
+            // is not missed.
+            notified.as_mut().enable();
+            if self.is_triggered() {
+                return;
+            }
+            notified.await;
         }
     }
 }

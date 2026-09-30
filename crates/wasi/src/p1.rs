@@ -2339,6 +2339,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                     .flags
                     .contains(types::Subclockflags::SUBSCRIPTION_CLOCK_ABSTIME)
                     && self.wasi.filesystem.allow_blocking_current_thread
+                    && self.wasi.clocks.interrupt.is_none()
                 {
                     std::thread::sleep(std::time::Duration::from_nanos(clocksub.timeout));
                     memory.write(

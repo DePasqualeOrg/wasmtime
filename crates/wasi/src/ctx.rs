@@ -1,5 +1,5 @@
 use crate::cli::{StdinStream, StdoutStream, WasiCliCtx};
-use crate::clocks::{HostMonotonicClock, HostWallClock, WasiClocksCtx};
+use crate::clocks::{HostMonotonicClock, HostWallClock, WasiClocksCtx, WasiClocksInterrupt};
 use crate::filesystem::{Dir, WasiFilesystemCtx};
 use crate::random::WasiRandomCtx;
 use crate::sockets::{SocketAddrCheck, SocketAddrUse, WasiSocketsCtx};
@@ -368,6 +368,19 @@ impl WasiCtxBuilder {
     /// By default the host's wall clock is used.
     pub fn wall_clock(&mut self, clock: impl HostWallClock + 'static) -> &mut Self {
         self.clocks.wall_clock = Box::new(clock);
+        self
+    }
+
+    /// Ends the guest's waits on `wasi:clocks` deadlines, including the sleeps
+    /// of `poll_oneoff`, once `interrupt` is triggered. See
+    /// [`WasiClocksInterrupt`].
+    ///
+    /// A context with an interrupt never sleeps on the current thread for
+    /// `poll_oneoff`, whatever
+    /// [`allow_blocking_current_thread`](Self::allow_blocking_current_thread)
+    /// says.
+    pub fn clocks_interrupt(&mut self, interrupt: WasiClocksInterrupt) -> &mut Self {
+        self.clocks.interrupt = Some(interrupt);
         self
     }
 

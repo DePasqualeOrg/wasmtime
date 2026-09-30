@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use tokio::io::{self, AsyncWrite};
 use wasmtime::Result;
 use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::clocks::WasiClocksInterrupt;
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi_io::streams::StreamError;
 
@@ -111,6 +112,35 @@ pub unsafe extern "C" fn wasi_config_set_env(
 #[unsafe(no_mangle)]
 pub extern "C" fn wasi_config_inherit_env(config: &mut wasi_config_t) {
     config.builder.inherit_env();
+}
+
+#[repr(C)]
+pub struct wasi_clocks_interrupt_t {
+    interrupt: WasiClocksInterrupt,
+}
+
+wasmtime_c_api_macros::declare_own!(wasi_clocks_interrupt_t);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_clocks_interrupt_new() -> Box<wasi_clocks_interrupt_t> {
+    Box::new(wasi_clocks_interrupt_t {
+        interrupt: WasiClocksInterrupt::new(),
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_clocks_interrupt_trigger(interrupt: &wasi_clocks_interrupt_t) {
+    interrupt.interrupt.trigger();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wasi_config_set_clocks_interrupt(
+    config: &mut wasi_config_t,
+    interrupt: &wasi_clocks_interrupt_t,
+) {
+    config
+        .builder
+        .clocks_interrupt(interrupt.interrupt.clone());
 }
 
 #[unsafe(no_mangle)]
