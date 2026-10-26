@@ -1643,6 +1643,16 @@ impl StoreOpaque {
         self.instances[id].handle.get()
     }
 
+    /// Accessor from `InstanceId` to `&vm::Instance`, if `id` is actually an
+    /// instance within this store.
+    ///
+    /// Unlike `instance`, this does not assume `id` has already been validated,
+    /// and so suits ids from an untrusted source.
+    #[inline]
+    pub fn try_instance(&self, id: InstanceId) -> Option<&vm::Instance> {
+        Some(self.instances.get(id)?.handle.get())
+    }
+
     /// Accessor from `InstanceId` to `Pin<&mut vm::Instance>`.
     ///
     /// Note that if you have a `StoreInstanceId` you should use
@@ -2249,7 +2259,7 @@ at https://bytecodealliance.org/security.
         // return into it.
         let current_epoch = self.engine().current_epoch();
         let epoch_deadline = self.vm_store_context.epoch_deadline.get_mut();
-        *epoch_deadline = current_epoch + delta;
+        *epoch_deadline = current_epoch.saturating_add(delta).min(u64::MAX - 1);
     }
 
     pub(crate) fn get_epoch_deadline(&mut self) -> u64 {
@@ -2257,10 +2267,19 @@ at https://bytecodealliance.org/security.
     }
 
     #[inline]
-    pub(crate) fn validate_sync_call(&self) -> Result<()> {
+    pub(crate) fn validate_sync_call(&mut self) -> Result<()> {
         #[cfg(feature = "async")]
         if self.async_state.async_required {
             bail!("store configuration requires that `*_async` functions are used instead");
+        }
+        // We disallow `[Typed]Func::call` from a fiber since it can lead to
+        // e.g. GC or epoch interruption which suspends the fiber, potentially
+        // returning control to the embedder and allowing it to poll a top-level
+        // `call_async` future from another thread, effectively and unsoundly
+        // sending `!Send` data across threads.  In addition, allowing such
+        // recursion risks panicking on stack overflow.
+        if self.can_block() {
+            bail!("cannot do blocking `call` from an async context");
         }
         Ok(())
     }

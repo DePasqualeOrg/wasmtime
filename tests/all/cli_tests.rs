@@ -162,7 +162,14 @@ fn assert_trap_code(status: &ExitStatus) {
 // Run a simple WASI hello world, snapshot0 edition.
 #[test]
 fn hello_wasi_snapshot0() -> Result<()> {
-    let stdout = run_wasmtime(&["tests/all/cli_tests/hello_wasi_snapshot0.wat"])?;
+    let output = wasmtime(&["tests/all/cli_tests/hello_wasi_snapshot0.wat"])?.output()?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unknown import: `wasi_unstable::proc_exit`")
+    );
+
+    let stdout = run_wasmtime(&["-Spreview0", "tests/all/cli_tests/hello_wasi_snapshot0.wat"])?;
     assert_eq!(stdout, "Hello, world!\n");
     Ok(())
 }
@@ -213,7 +220,8 @@ fn timeout_in_invoke() -> Result<()> {
 // Exit with a valid non-zero exit code, snapshot0 edition.
 #[test]
 fn exit2_wasi_snapshot0() -> Result<()> {
-    let output = wasmtime(&["tests/all/cli_tests/exit2_wasi_snapshot0.wat"])?.output()?;
+    let output =
+        wasmtime(&["-Spreview0", "tests/all/cli_tests/exit2_wasi_snapshot0.wat"])?.output()?;
     assert_eq!(output.status.code().unwrap(), 2);
     Ok(())
 }
@@ -229,7 +237,11 @@ fn exit2_wasi_snapshot1() -> Result<()> {
 // Exit with a valid non-zero exit code, snapshot0 edition.
 #[test]
 fn exit125_wasi_snapshot0() -> Result<()> {
-    let output = wasmtime(&["tests/all/cli_tests/exit125_wasi_snapshot0.wat"])?.output()?;
+    let output = wasmtime(&[
+        "-Spreview0",
+        "tests/all/cli_tests/exit125_wasi_snapshot0.wat",
+    ])?
+    .output()?;
     dbg!(&output);
     assert_eq!(output.status.code().unwrap(), 125);
     Ok(())
@@ -246,7 +258,11 @@ fn exit125_wasi_snapshot1() -> Result<()> {
 // Exit with an invalid non-zero exit code, snapshot0 edition.
 #[test]
 fn exit126_wasi_snapshot0() -> Result<()> {
-    let output = wasmtime(&["tests/all/cli_tests/exit126_wasi_snapshot0.wat"])?.output()?;
+    let output = wasmtime(&[
+        "-Spreview0",
+        "tests/all/cli_tests/exit126_wasi_snapshot0.wat",
+    ])?
+    .output()?;
     assert_eq!(output.status.code().unwrap(), 1);
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid exit status"));
@@ -374,7 +390,8 @@ fn run_cwasm() -> Result<()> {
 #[test]
 fn hello_wasi_snapshot0_from_stdin() -> Result<()> {
     let stdout = run_cmd(
-        wasmtime(&["-"])?.stdin(File::open("tests/all/cli_tests/hello_wasi_snapshot0.wat")?),
+        wasmtime(&["-Spreview0", "-"])?
+            .stdin(File::open("tests/all/cli_tests/hello_wasi_snapshot0.wat")?),
     )?;
     assert_eq!(stdout, "Hello, world!\n");
     Ok(())
@@ -1783,6 +1800,31 @@ mod test_programs {
     }
 
     #[test]
+    fn p2_cli_reject_zero_outgoing_body_options() -> Result<()> {
+        // The outgoing body writer requires at least one buffered chunk and a
+        // non-zero write budget, so a zero here is a configuration error.
+        for option in [
+            "-Shttp-outgoing-body-buffer-chunks=0",
+            "-Shttp-outgoing-body-chunk-size=0",
+        ] {
+            let err = run_wasmtime(&[
+                "run",
+                "-Shttp=y",
+                option,
+                P2_CLI_RUN_OUTGOING_BODY_CHUNK_SIZE_COMPONENT,
+            ])
+            .unwrap_err();
+            let err = format!("{err:?}");
+            assert!(
+                err.contains("value must be non-zero"),
+                "expected `{option}` to be rejected, got: {err}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn p2_cli_run_outgoing_body_chunk_size() -> Result<()> {
         // Without the option an outgoing body keeps its 1 MiB default budget.
         let stdout = run_wasmtime(&[
@@ -2609,7 +2651,6 @@ start a print 1234
     #[cfg(unix)]
     #[tokio::test]
     async fn serve_inherit() -> Result<()> {
-        use rustix::fd::AsRawFd;
         use std::mem::ManuallyDrop;
         use std::net::TcpListener;
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -2623,29 +2664,25 @@ start a print 1234
             return Ok(());
         }
 
-        // This socket is required to be inherited to the child process as fd 3.
-        // This is done with a `dup2` below. If this socket is itself 3,
-        // however, then the `dup2` will be a noop. This `socket` is CLOEXEC,
-        // however, so if `dup2` is a noop then nothing will be inherited. Force
-        // this socket to NOT be fd 3 in this case by `dup`-ing it.
-        let tcp_socket = {
-            let mut socket = TcpListener::bind("localhost:0")?;
-            if socket.as_raw_fd() == 3 {
-                socket = socket.try_clone()?;
-                assert!(socket.as_raw_fd() != 3);
-            }
-            socket.set_nonblocking(true)?;
-            socket
-        };
+        // These sockets are required to be inherited to the child process as
+        // fds 3 and 4, which is done with `dup2` below. If either socket
+        // already lives at fd 3 or 4, however, then the `dup2` calls can
+        // clobber one another (e.g. if the unix socket is fd 3 then the first
+        // `dup2` closes it) or be a noop leaving a CLOEXEC fd in place. Tests
+        // run in parallel so fds 3/4 may be freed by another thread at any
+        // time, so unconditionally move both sockets to fds >= 5 to avoid
+        // this.
+        let tcp_socket = TcpListener::from(rustix::io::fcntl_dupfd_cloexec(
+            TcpListener::bind("localhost:0")?,
+            5,
+        )?);
+        tcp_socket.set_nonblocking(true)?;
 
         let addr = tcp_socket.local_addr()?;
-        let (mut unix_socket, unix_path) = tempfile::Builder::new()
+        let (unix_socket, unix_path) = tempfile::Builder::new()
             .make(|path| UnixListener::bind(path))?
             .into_parts();
-        if unix_socket.as_raw_fd() == 4 {
-            unix_socket = unix_socket.try_clone()?;
-            assert!(unix_socket.as_raw_fd() != 4);
-        }
+        let unix_socket = UnixListener::from(rustix::io::fcntl_dupfd_cloexec(unix_socket, 5)?);
 
         // Using a shell script as a launcher since that uses exec, allowing us to provide the
         // LISTEN_PID variable.
@@ -3175,6 +3212,32 @@ start a print 1234
     #[test]
     fn p3_cli_deny_listen() -> Result<()> {
         run_wasmtime(&["run", "-Stcp", P3_CLI_DENY_LISTEN_COMPONENT])?;
+        Ok(())
+    }
+
+    #[test]
+    fn p2_cli_stdout_write_zeros_to_sink() -> Result<()> {
+        for n in ["0", "100", "10000"] {
+            run_wasmtime(&[
+                "run",
+                "-Sinherit-stdout=n",
+                P2_CLI_STDOUT_WRITE_ZEROS_TO_SINK_COMPONENT,
+                n,
+            ])?;
+        }
+        let output = super::wasmtime(&[
+            "run",
+            "-Sinherit-stdout=n",
+            P2_CLI_STDOUT_WRITE_ZEROS_TO_SINK_COMPONENT,
+            "10000000000",
+        ])?
+        .output()?;
+        assert_eq!(output.stdout, b"");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cannot write more zeroes than `check_write` allows"),
+            "bad stderr: {stderr}"
+        );
         Ok(())
     }
 }
@@ -4081,5 +4144,45 @@ fn hostcall_fuel() -> Result<()> {
             .is_err()
         );
     }
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(target_pointer_width = "32", ignore)] // this test takes 4GiB virtual memory
+fn wasi_snapshot0_poll_oneoff_hostcall_fuel() -> Result<()> {
+    let stdout = run_wasmtime(&[
+        "run",
+        "-Shostcall-fuel=1000,preview0=y",
+        "--invoke=run",
+        "tests/all/cli_tests/poll-oneoff.wat",
+    ])?;
+    assert_eq!(stdout, "48\n"); // `errno::nomem`
+    Ok(())
+}
+
+// The CLI derives the async stack size from `-Wmax-wasm-stack` when the latter
+// is set on its own, and that derivation used to overflow for very large
+// values. A stack that large may legitimately fail to be allocated, but the
+// CLI must not panic while computing the async stack size.
+/// An enormous `-W max-wasm-stack` must not overflow the CLI's derivation of the
+/// async stack size.
+///
+/// This asserts the absence of the *overflow*, not the absence of *any* failure:
+/// on a 32-bit target `usize::MAX` asks for a ~4 GiB stack, so an allocation
+/// failure is a legitimate outcome there (the merge queue's i686 job failed once
+/// because this test demanded that the request succeed).
+#[test]
+fn max_wasm_stack_large_value_does_not_overflow() -> Result<()> {
+    let output = run_wasmtime(&[
+        "run",
+        "-W",
+        &format!("max-wasm-stack={}", usize::MAX),
+        "tests/all/cli_tests/simple.wat",
+    ]);
+    let output = format!("{output:?}");
+    assert!(
+        !output.contains("attempt to add with overflow"),
+        "the async stack size derivation overflowed: {output}"
+    );
     Ok(())
 }

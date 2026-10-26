@@ -138,9 +138,7 @@ pub extern "C" fn wasi_config_set_clocks_interrupt(
     config: &mut wasi_config_t,
     interrupt: &wasi_clocks_interrupt_t,
 ) {
-    config
-        .builder
-        .clocks_interrupt(interrupt.interrupt.clone());
+    config.builder.clocks_interrupt(interrupt.interrupt.clone());
 }
 
 #[unsafe(no_mangle)]
@@ -271,7 +269,7 @@ impl wasmtime_wasi::p2::OutputStream for CustomOutputStream {
         Ok(())
     }
     fn check_write(&mut self) -> Result<usize, StreamError> {
-        Ok(usize::MAX)
+        Ok(64 * 1024)
     }
 }
 

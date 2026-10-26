@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::task::{Context, Poll};
 use wasmtime::*;
+use wasmtime_test_macros::wasmtime_test;
 
 struct SetFlagOnDrop(Arc<AtomicBool>);
 
@@ -2218,6 +2219,56 @@ fn copying_collector_externref_survives_gc() -> Result<()> {
     Ok(())
 }
 
+/// A host function that calls, via `Func::call`, another host function that
+/// collects must not cause the Wasm frames beneath them to be traced twice.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn issue_14463_nested_host_call_gc_moves_object_once() -> Result<()> {
+    let _ = env_logger::try_init();
+    for collector in [Collector::Copying, Collector::DeferredReferenceCounting] {
+        let mut config = Config::new();
+        config.wasm_gc(true);
+        config.wasm_function_references(true);
+        config.collector(collector);
+
+        let engine = Engine::new(&config)?;
+
+        let module = Module::new(
+            &engine,
+            r#"
+                (module
+                    (type $s (struct (field i32)))
+                    (type $f (func))
+                    (table (export "t") 1 funcref)
+                    (global $g (mut (ref null $s)) (ref.null $s))
+                    (func (export "run") (result i32) (local $x (ref null $s))
+                        (local.set $x (struct.new $s (i32.const 7)))
+                        (global.set $g (local.get $x))
+                        (call_indirect (type $f) (i32.const 0))
+                        (ref.eq (local.get $x) (global.get $g))
+                    )
+                )
+            "#,
+        )?;
+
+        let mut store = Store::new(&engine, ());
+
+        let inner = Func::wrap(&mut store, |mut caller: Caller<'_, ()>| caller.gc(None));
+        let outer = Func::wrap(&mut store, move |mut caller: Caller<'_, ()>| {
+            inner.call(&mut caller, &[], &mut [])
+        });
+
+        let instance = Instance::new(&mut store, &module, &[])?;
+
+        let table = instance.get_table(&mut store, "t").unwrap();
+        table.set(&mut store, 0, Ref::Func(Some(outer)))?;
+
+        let run = instance.get_typed_func::<(), i32>(&mut store, "run")?;
+        assert_eq!(run.call(&mut store, ())?, 1, "collector = {collector:?}");
+    }
+    Ok(())
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn issue_13173_gc_heap_uses_gc_tunables_no_signals() -> Result<()> {
@@ -3796,6 +3847,7 @@ fn initial_size_larger_than_reservation() -> Result<()> {
 fn winch_externref_survives_gc_in_frame() -> Result<()> {
     for collector in [Collector::Null, Collector::Copying] {
         let mut config = Config::new();
+        config.gc_support(true);
         config.strategy(Strategy::Winch);
         config.collector(collector);
         let Ok(engine) = Engine::new(&config) else {
@@ -3839,12 +3891,98 @@ fn winch_externref_survives_gc_in_frame() -> Result<()> {
     Ok(())
 }
 
+/// Typed null selects retain a valid reference representation across a GC call.
+#[wasmtime_test(
+    strategies(only(Winch)),
+    collectors(All),
+    wasm_features(reference_types)
+)]
+fn typed_select_null_across_gc(config: &mut Config) -> Result<()> {
+    let engine = Engine::new(config)?;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (import "" "gc" (func $gc))
+              (func (export "select-null") (param i32) (result externref)
+                ref.null extern
+                ref.null extern
+                local.get 0
+                select (result externref)
+                call $gc))
+            "#,
+    )?;
+    let mut store = Store::new(&engine, 0usize);
+    let gc = Func::wrap(&mut store, |mut cx: Caller<'_, usize>| -> Result<()> {
+        cx.gc(None)?;
+        *cx.data_mut() += 1;
+        Ok(())
+    });
+    let instance = Instance::new(&mut store, &module, &[gc.into()])?;
+    let select =
+        instance.get_typed_func::<i32, Option<Rooted<ExternRef>>>(&mut store, "select-null")?;
+    for cond in [0, 1] {
+        assert!(select.call(&mut store, cond)?.is_none());
+    }
+    assert_eq!(*store.data(), 2, "GC calls did not run");
+    Ok(())
+}
+
+/// A typed select must keep a live externref in the call-site stack map even
+/// when its unselected operand is null.
+#[wasmtime_test(
+    strategies(only(Winch)),
+    collectors(All),
+    wasm_features(reference_types)
+)]
+fn typed_select_preserves_externref_across_gc(config: &mut Config) -> Result<()> {
+    let engine = Engine::new(config)?;
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (import "" "make" (func $make (result externref)))
+              (import "" "gc" (func $gc))
+
+              (func (export "control") (result externref)
+                call $make
+                call $gc)
+
+              (func (export "selected") (result externref)
+                call $make
+                ref.null extern
+                i32.const 1
+                select (result externref)
+                call $gc))
+            "#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    let make = Func::wrap(
+        &mut store,
+        |mut cx: Caller<'_, ()>| -> Result<Option<Rooted<ExternRef>>> {
+            Ok(Some(ExternRef::new(&mut cx, 0xDECAFu32)?))
+        },
+    );
+    let gc = Func::wrap(&mut store, |mut cx: Caller<'_, ()>| cx.gc(None));
+    let instance = Instance::new(&mut store, &module, &[make.into(), gc.into()])?;
+    for export in ["control", "selected"] {
+        let func = instance.get_typed_func::<(), Option<Rooted<ExternRef>>>(&mut store, export)?;
+        let result = func.call(&mut store, ())?.expect("reference became null");
+        let data = result
+            .data(&store)?
+            .and_then(|value| value.downcast_ref::<u32>().copied());
+        assert_eq!(data, Some(0xDECAF), "{export}");
+    }
+    Ok(())
+}
+
 /// The write barrier's decrement chain releases an object once a global stops
 /// holding the last reference to it.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn winch_drc_write_barrier_drops_old_global_value() -> Result<()> {
     let mut config = Config::new();
+    config.gc_support(true);
     config.strategy(Strategy::Winch);
     config.collector(Collector::DeferredReferenceCounting);
     let Ok(engine) = Engine::new(&config) else {
@@ -3890,6 +4028,7 @@ fn winch_drc_write_barrier_drops_old_global_value() -> Result<()> {
 #[cfg_attr(miri, ignore)]
 fn winch_drc_read_barrier_keeps_loaded_ref_alive() -> Result<()> {
     let mut config = Config::new();
+    config.gc_support(true);
     config.strategy(Strategy::Winch);
     config.collector(Collector::DeferredReferenceCounting);
     let Ok(engine) = Engine::new(&config) else {
@@ -3945,6 +4084,7 @@ fn winch_drc_read_barrier_keeps_loaded_ref_alive() -> Result<()> {
 #[cfg_attr(miri, ignore)]
 fn winch_drc_i31_wrapped_as_externref_skips_global_barriers() -> Result<()> {
     let mut config = Config::new();
+    config.gc_support(true);
     config.strategy(Strategy::Winch);
     config.collector(Collector::DeferredReferenceCounting);
     let Ok(engine) = Engine::new(&config) else {
@@ -3992,6 +4132,7 @@ fn winch_drc_i31_wrapped_as_externref_skips_global_barriers() -> Result<()> {
 #[cfg_attr(miri, ignore)]
 fn winch_drc_read_barrier_forces_gc_at_threshold() -> Result<()> {
     let mut config = Config::new();
+    config.gc_support(true);
     config.strategy(Strategy::Winch);
     config.collector(Collector::DeferredReferenceCounting);
     let Ok(engine) = Engine::new(&config) else {
@@ -4070,6 +4211,7 @@ fn winch_ref_params_and_results_across_gc() -> Result<()> {
         );
         for collector in [Collector::Null, Collector::Copying] {
             let mut config = Config::new();
+            config.gc_support(true);
             config.strategy(Strategy::Winch);
             config.collector(collector);
             let Ok(engine) = Engine::new(&config) else {

@@ -399,12 +399,14 @@ impl RunCommon {
                 .common
                 .wasi
                 .http_outgoing_body_buffer_chunks
-                .unwrap_or_else(|| wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS),
+                .map(|n| n.get())
+                .unwrap_or(wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS),
             p2_outgoing_body_chunk_size: self
                 .common
                 .wasi
                 .http_outgoing_body_chunk_size
-                .unwrap_or_else(|| wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_CHUNK_SIZE),
+                .map(|n| n.get())
+                .unwrap_or(wasmtime_wasi_http::p2::DEFAULT_OUTGOING_BODY_CHUNK_SIZE),
         }
     }
 
@@ -498,6 +500,9 @@ impl RunCommon {
         }
         if let Some(fuel) = self.common.wasi.hostcall_fuel {
             store.set_hostcall_fuel(fuel);
+        }
+        if let Some(max) = self.common.wasi.max_component_handles {
+            store.set_max_component_handles(max);
         }
 
         *limits(store.data_mut()) = self.store_limits();

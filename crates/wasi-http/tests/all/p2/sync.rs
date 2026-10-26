@@ -26,7 +26,7 @@ fn p2_http_outbound_request_get() -> Result<()> {
 
 #[test_log::test]
 fn p2_http_outbound_request_timeout() -> Result<()> {
-    let server = Server::http1(1)?;
+    let server = Server::http1(3)?;
     run(P2_HTTP_OUTBOUND_REQUEST_TIMEOUT_COMPONENT, &server)
 }
 
@@ -40,6 +40,12 @@ fn p2_http_outbound_request_post() -> Result<()> {
 fn p2_http_outbound_request_large_post() -> Result<()> {
     let server = Server::http1(1)?;
     run(P2_HTTP_OUTBOUND_REQUEST_LARGE_POST_COMPONENT, &server)
+}
+
+#[test_log::test]
+fn p2_http_outbound_request_long_path() -> Result<()> {
+    let server = Server::http1(1)?;
+    run(P2_HTTP_OUTBOUND_REQUEST_LONG_PATH_COMPONENT, &server)
 }
 
 #[test_log::test]
